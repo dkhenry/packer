@@ -3,7 +3,6 @@ package ansible
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -69,7 +68,7 @@ func (c *adapter) Handle(conn net.Conn, errc chan<- error) error {
 	c.ui.Say("SSH proxy: accepted connection")
 	_, chans, reqs, err := ssh.NewServerConn(conn, c.config)
 	if err != nil {
-		return errors.New("failed to handshake")
+		return fmt.Errorf("SSH Proxy handshake failure: %v", err)
 	}
 
 	// discard all global requests
