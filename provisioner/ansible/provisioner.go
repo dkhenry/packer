@@ -3,6 +3,10 @@ package ansible
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -74,13 +78,14 @@ func (p *Provisioner) Prepare(raws ...interface{}) error {
 		errs = packer.MultiErrorAppend(errs, err)
 	}
 
-	err = validateFileConfig(p.config.SSHAuthorizedKeyFile, "ssh_authorized_key_file", true)
-	if err != nil {
-		errs = packer.MultiErrorAppend(errs, err)
-	}
+	// Check that the authorized key file exists ( this should really be called the public key )
+	// Check for either file ( if you specify either file you must specify both files )
+	if len(p.config.SSHAuthorizedKeyFile) > 0 || len(p.config.SSHHostKeyFile) > 0 {
+		err = validateFileConfig(p.config.SSHAuthorizedKeyFile, "ssh_authorized_key_file", true)
+		if err != nil {
+			errs = packer.MultiErrorAppend(errs, err)
+		}
 
-	// Check that the host key file exists, if configured
-	if len(p.config.SSHHostKeyFile) > 0 {
 		err = validateFileConfig(p.config.SSHHostKeyFile, "ssh_host_key_file", true)
 		if err != nil {
 			log.Println(p.config.SSHHostKeyFile, "does not exist")
@@ -100,17 +105,82 @@ func (p *Provisioner) Prepare(raws ...interface{}) error {
 	return nil
 }
 
+type Keys struct {
+	public   ssh.PublicKey
+	private  ssh.Signer
+	filename string
+}
+
 func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 	ui.Say("Provisioning with Ansible...")
 
-	pubKeyBytes, err := ioutil.ReadFile(p.config.SSHAuthorizedKeyFile)
-	if err != nil {
-		return errors.New("Failed to load authorized key file")
+	keyFactory := func(pubKeyFile string, privKeyFile string) (*Keys, error) {
+		var public ssh.PublicKey
+		var private ssh.Signer
+
+		if len(pubKeyFile) > 0 || len(privKeyFile) > 0 {
+			pubKeyBytes, err := ioutil.ReadFile(pubKeyFile)
+			if err != nil {
+				return nil, errors.New("Failed to read public key")
+			}
+			public, _, _, _, err := ssh.ParseAuthorizedKey(pubKeyBytes)
+			if err != nil {
+				return nil, errors.New("Failed to parse authorized key")
+			}
+
+			privateBytes, err := ioutil.ReadFile(privKeyFile)
+			if err != nil {
+				return nil, errors.New("Failed to load private host key")
+			}
+
+			private, err := ssh.ParsePrivateKey(privateBytes)
+			if err != nil {
+				return nil, errors.New("Failed to parse private host key")
+			}
+			return &Keys{public, private, privKeyFile}, nil
+		} else {
+			key, err := rsa.GenerateKey(rand.Reader, 2048)
+			if err != nil {
+				return nil, errors.New("Failed to generate key pair")
+			}
+			public, err = ssh.NewPublicKey(key.Public())
+			if err != nil {
+				return nil, errors.New("Failed to extract public key from generated key pair")
+			}
+			private, err = ssh.NewSignerFromKey(key)
+			if err != nil {
+				return nil, errors.New("Failed to extract private key from generated key pair")
+			}
+
+			// To support Ansible calling back to us we need to write
+			// this file down
+			privateKeyDer := x509.MarshalPKCS1PrivateKey(key)
+			privateKeyBlock := pem.Block{
+				Type:    "RSA PRIVATE KEY",
+				Headers: nil,
+				Bytes:   privateKeyDer,
+			}
+			tf, err := ioutil.TempFile("", "ansible-key")
+			if err != nil {
+				return nil, errors.New("failed to create temp file for generated key")
+			}
+			_, err = tf.Write(pem.EncodeToMemory(&privateKeyBlock))
+			if err != nil {
+				return nil, errors.New("failed to write private key to temp file")
+			}
+
+			err = tf.Close()
+			if err != nil {
+				return nil, errors.New("failed to close private key temp file")
+			}
+
+			return &Keys{public, private, tf.Name()}, nil
+		}
 	}
 
-	public, _, _, _, err := ssh.ParseAuthorizedKey(pubKeyBytes)
+	k, err := keyFactory(p.config.SSHAuthorizedKeyFile, p.config.SSHHostKeyFile)
 	if err != nil {
-		return errors.New("Failed to parse authorized key")
+		return err
 	}
 
 	keyChecker := ssh.CertChecker{
@@ -120,7 +190,7 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 				return nil, errors.New("authentication failed")
 			}
 
-			if !bytes.Equal(public.Marshal(), pubKey.Marshal()) {
+			if !bytes.Equal(k.public.Marshal(), pubKey.Marshal()) {
 				ui.Say("unauthorized key")
 				return nil, errors.New("authentication failed")
 			}
@@ -136,17 +206,7 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 		//NoClientAuth:      true,
 	}
 
-	privateBytes, err := ioutil.ReadFile(p.config.SSHHostKeyFile)
-	if err != nil {
-		return errors.New("Failed to load private host key")
-	}
-
-	private, err := ssh.ParsePrivateKey(privateBytes)
-	if err != nil {
-		return errors.New("Failed to parse private host key")
-	}
-
-	config.AddHostKey(private)
+	config.AddHostKey(k.private)
 
 	localListener, err := func() (net.Listener, error) {
 		port, _ := strconv.ParseUint(p.config.LocalPort, 10, 16)
@@ -199,7 +259,7 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 		}()
 	}
 
-	if err := p.executeAnsible(ui, comm); err != nil {
+	if err := p.executeAnsible(ui, comm, k.filename); err != nil {
 		return fmt.Errorf("Error executing Ansible: %s", err)
 	}
 
@@ -217,11 +277,11 @@ func (p *Provisioner) Cancel() {
 	os.Exit(0)
 }
 
-func (p *Provisioner) executeAnsible(ui packer.Ui, comm packer.Communicator) error {
+func (p *Provisioner) executeAnsible(ui packer.Ui, comm packer.Communicator, authToken string) error {
 	playbook, _ := filepath.Abs(p.config.PlaybookFile)
 	inventory := p.config.inventoryFile
 
-	args := []string{playbook, "-i", inventory}
+	args := []string{playbook, "-i", inventory, "--private-key", authToken}
 	args = append(args, p.config.ExtraArguments...)
 
 	cmd := exec.Command(p.config.Command, args...)
