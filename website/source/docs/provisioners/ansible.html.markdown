@@ -48,14 +48,17 @@ Required Parameters:
 Optional Parameters:
 
 - `ssh_host_key_file` (string) - The SSH key that will be used to run
-  the SSH server to which Ansible connects. If this paramater is
-  specified the `ssh_authorized_key_file` must also be specified. The
-  default behaviour is to generate and use a one time key
+  the SSH server on the host machine to forward commands to the target
+  machine. Ansible connects to this server and will validate the
+  identity of the server using the system known_hosts. The default behaviour is
+  to generate and use a one time key, and disable
+  host_key_verification in ansible to allow it to connect to the
+  server 
 
 - `ssh_authorized_key_file` (string) - The SSH public key of the
-  Ansible `ssh_user`. If this paramater is specified the
-  `ssh_host_key_file` must also be specified. The default behaviour is
-  to generate and use a one time key
+  Ansible `ssh_user`. The default behaviour is to generate and use a
+  one time key. If this file is generated the coorisponding private
+  key will be passed via the `--private-key` option to Ansible.
 
 - `local_port` (string) - The port on which to 
   attempt to listen for SSH connections. This value is a starting point.
